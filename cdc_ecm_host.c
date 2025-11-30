@@ -85,7 +85,7 @@ static cdc_ecm_obj_t *p_cdc_ecm_obj = NULL;
  * This configuration is used when user passes NULL to config pointer during device open.
  */
 static const cdc_ecm_host_driver_config_t cdc_ecm_driver_config_default = {
-    .driver_task_stack_size = 4096,
+    .driver_task_stack_size = 8192,
     .driver_task_priority = 10,
     .xCoreID = 0,
     .new_dev_cb = NULL,
@@ -1150,7 +1150,12 @@ esp_err_t cdc_ecm_host_data_tx_blocking(cdc_ecm_dev_hdl_t cdc_hdl, const uint8_t
         return ESP_ERR_INVALID_ARG;
     };
 
-    ESP_GOTO_ON_ERROR(usb_host_transfer_submit(cdc_dev->data.out_xfer), unblock, TAG, "Failed to submit BULK OUT transfer");
+    ret = usb_host_transfer_submit(cdc_dev->data.out_xfer);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "usb_host_transfer_submit failed: %s", esp_err_to_name(ret));
+        // let lwIP drop this frame
+        goto unblock;
+    }
 
     // Wait for OUT transfer completion
     taken = xSemaphoreTake(transfer_finished_semaphore, pdMS_TO_TICKS(timeout_ms));
@@ -1535,9 +1540,13 @@ static esp_err_t netif_transmit(void *h, void *buffer, size_t len)
     {
         size_t chunk_len = remaining_len > out_buf_len ? out_buf_len : remaining_len;
 
-        if (cdc_ecm_host_data_tx_blocking(cdc_dev, data_ptr, chunk_len, 500) != ESP_OK)
-        {
-            return ESP_FAIL;
+        esp_err_t err = cdc_ecm_host_data_tx_blocking(cdc_dev, data_ptr, chunk_len, 100);
+        if (err != ESP_OK) {
+            // Log once per attempt
+            ESP_LOGW(TAG, "netif_transmit: dropping frame chunk, tx_blocking failed: %s",
+                     esp_err_to_name(err));
+            // Drop this entire frame; returning OK here prevents lwIP from panicking.
+            return ESP_OK;
         }
 
         data_ptr += chunk_len;
@@ -1566,12 +1575,18 @@ esp_err_t cdc_ecm_netif_init(cdc_ecm_dev_hdl_t cdc_hdl, cdc_ecm_params_t *params
 
     esp_netif_ip_info_t ip_info = {0};
 
+    // Set flags based on whether DHCP should be enabled
+    esp_netif_flags_t netif_flags = ESP_NETIF_FLAG_EVENT_IP_MODIFIED | ESP_NETIF_FLAG_AUTOUP;
+    if (!params->disable_dhcp) {
+        netif_flags |= ESP_NETIF_DHCP_CLIENT;
+    }
+
     esp_netif_inherent_config_t base_cfg = {
-        .flags = ESP_NETIF_FLAG_EVENT_IP_MODIFIED | ESP_NETIF_FLAG_AUTOUP | ESP_NETIF_DHCP_CLIENT,
+        .flags = netif_flags,
         .ip_info = &ip_info,
         .get_ip_event = IP_EVENT_ETH_GOT_IP,
         .lost_ip_event = IP_EVENT_ETH_LOST_IP,
-        .if_key = "cdc_ecm_host",
+        .if_key = "ETH_DEF",
         .if_desc = "usb cdc ecm host device",
         .route_prio = 10};
 
@@ -1609,10 +1624,15 @@ esp_err_t cdc_ecm_netif_init(cdc_ecm_dev_hdl_t cdc_hdl, cdc_ecm_params_t *params
     }
     esp_netif_set_mac(usb_netif, cdc_dev->mac);
 
-    err = esp_netif_dhcpc_start(usb_netif);
-    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED)
-    {
-        ESP_LOGE(TAG, "Failed to start DHCP client: %s", esp_err_to_name(err));
+    // Only start DHCP if needed
+    if (!params->disable_dhcp) {
+        err = esp_netif_dhcpc_start(usb_netif);
+        if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED)
+        {
+            ESP_LOGE(TAG, "Failed to start DHCP client: %s", esp_err_to_name(err));
+        }
+    } else {
+        ESP_LOGI(TAG, "DHCP disabled per configuration (manual IP will be used)");
     }
 
     if (params->hostname)
@@ -1670,7 +1690,11 @@ static void cdc_ecm_task(void *arg)
     cdc_ecm_params_t *params = (cdc_ecm_params_t *)arg;
 
     device_disconnected_sem = xSemaphoreCreateBinary();
-    assert(device_disconnected_sem);
+    if (device_disconnected_sem == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate device_disconnected_sem - Out of Memory!");
+        vTaskDelete(NULL); // Stop this task safely
+        return;
+    }
 
     // Install USB Host driver (should only be done once)
     ESP_LOGI(TAG, "Installing USB Host");
@@ -1727,8 +1751,8 @@ static void cdc_ecm_task(void *arg)
 
         if (params->event_cb)
         {
-            esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, params->event_cb, NULL);
-            esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, params->event_cb, NULL);
+            esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, params->event_cb, params->callback_arg);
+            esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, params->event_cb, params->callback_arg);
         }
 
         // Post an event to start the Ethernet connection.
@@ -1776,6 +1800,6 @@ void cdc_ecm_init(cdc_ecm_params_t *cdc_ecm_params)
 {
     assert(cdc_ecm_params != NULL);
     // Create the task that handles the host installation and connection loop.
-    BaseType_t task_created = xTaskCreate(cdc_ecm_task, "cdc_ecm_task", 1024 * 4, cdc_ecm_params, CDC_ECM_USB_HOST_PRIORITY, NULL);
+    BaseType_t task_created = xTaskCreate(cdc_ecm_task, "cdc_ecm_task", 1024 * 8, cdc_ecm_params, CDC_ECM_USB_HOST_PRIORITY, NULL);
     assert(task_created == pdTRUE);
 }
